@@ -2,6 +2,7 @@ import json
 import math
 import random
 import re
+
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -20,19 +21,25 @@ COMPARISON_FILE = (
 )
 
 OUTPUT_FILE = (
-    "recommendation_chat_dataset.json"
+    "recommendation_chat_dataset_v2.json"
 )
 
 RANDOM_SEED = 42
 
-# Bir öneri cevabında maksimum kaç ürün sıralansın?
+# Recommendation hedefi
+TARGET_RECOMMENDATION_COUNT = 2500
+
+# Bir cevapta gösterilecek maksimum ürün
 TOP_N_RECOMMENDATIONS = 3
 
-# Bir grupta öneri üretmek için minimum ürün
-MIN_PRODUCTS_PER_GROUP = 3
+# Grup oluşturmak için minimum ürün
+MIN_PRODUCTS_PER_GROUP = 2
 
-# Marka + kategori başına maksimum kaç recommendation örneği
-MAX_RECOMMENDATIONS_PER_GROUP = 5
+# Rating filtresi
+MIN_GOOD_RATING = 4.0
+
+# Teknik özellik önerilerinde minimum eşleşen ürün
+MIN_ATTRIBUTE_MATCH_COUNT = 2
 
 
 random.seed(
@@ -234,7 +241,10 @@ def parse_float(
             )
         )
 
-    except ValueError:
+    except (
+        ValueError,
+        TypeError,
+    ):
 
         return None
 
@@ -269,7 +279,7 @@ def parse_int(
 
 
 # ============================================================
-# KATEGORİ BELİRLEME
+# KATEGORİ
 # ============================================================
 
 def get_category(
@@ -319,10 +329,7 @@ def get_category(
         or ""
     ).lower()
 
-    # Örnek:
-    # Laptop > LENOVO Laptop
-    #
-    # LENOVO Laptop yerine Laptop kullan
+    # LENOVO Laptop -> Laptop
     if (
         len(
             categories
@@ -374,9 +381,7 @@ def load_products():
                     )
                 )
 
-            except (
-                json.JSONDecodeError
-            ):
+            except json.JSONDecodeError:
 
                 continue
 
@@ -418,6 +423,14 @@ def load_products():
                 product
             )
 
+            product[
+                "_brand"
+            ] = clean_text(
+                product.get(
+                    "brand"
+                )
+            )
+
             products.append(
                 product
             )
@@ -426,22 +439,23 @@ def load_products():
 
 
 # ============================================================
-# COMPARISON DATASET YÜKLE
+# COMPARISON DATASET
 # ============================================================
 
 def load_comparison_dataset():
 
-    if not Path(
+    path = Path(
         COMPARISON_FILE
-    ).exists():
+    )
+
+    if not path.exists():
 
         raise FileNotFoundError(
-            f"{COMPARISON_FILE} "
-            "bulunamadı."
+            f"{COMPARISON_FILE} bulunamadı."
         )
 
     with open(
-        COMPARISON_FILE,
+        path,
         "r",
         encoding="utf-8",
     ) as file:
@@ -463,21 +477,69 @@ def create_chat_record(
     return {
         "messages": [
             {
-                "role":
-                    "user",
-
-                "content":
-                    question,
+                "role": "user",
+                "content": question,
             },
             {
-                "role":
-                    "assistant",
-
-                "content":
-                    answer,
+                "role": "assistant",
+                "content": answer,
             },
         ]
     }
+
+
+# ============================================================
+# ÜRÜN TANIMI
+# ============================================================
+
+def describe_product(
+    product,
+):
+
+    name = product[
+        "product_name"
+    ]
+
+    parts = [
+        name
+    ]
+
+    price = product.get(
+        "_price"
+    )
+
+    rating = product.get(
+        "_rating"
+    )
+
+    review_count = product.get(
+        "_review_count",
+        0,
+    )
+
+    if price is not None:
+
+        parts.append(
+            format_price(
+                price
+            )
+        )
+
+    if rating is not None:
+
+        parts.append(
+            f"{rating:g} puan"
+        )
+
+    if review_count:
+
+        parts.append(
+            f"{review_count} değerlendirme"
+        )
+
+    return ", ".join(
+        parts
+    )
 
 
 # ============================================================
@@ -488,19 +550,6 @@ def calculate_value_score(
     product,
     group,
 ):
-    """
-    Basit ve açıklanabilir bir fiyat-performans skoru.
-
-    Kullanılan faktörler:
-
-    - fiyat
-    - rating
-    - değerlendirme sayısı
-    - teknik özellik doluluğu
-
-    Bu skor gerçek bir benchmark değildir.
-    Dataset içindeki ürünleri göreli sıralamak için kullanılır.
-    """
 
     price = product.get(
         "_price"
@@ -539,7 +588,10 @@ def calculate_value_score(
         is not None
     ]
 
-    if not valid_prices:
+    if len(
+        valid_prices
+    ) < 2:
+
         return None
 
     min_price = min(
@@ -554,7 +606,6 @@ def calculate_value_score(
         price
     )
 
-    # Daha ucuz ürün daha yüksek fiyat skoru
     if (
         max_price
         == min_price
@@ -572,14 +623,11 @@ def calculate_value_score(
             - min_price
         )
 
-    # Rating 5 üzerinden
     rating_score = (
         rating
         / 5.0
     )
 
-    # Çok yüksek review count değerlerinin
-    # skoru domine etmesini engellemek için log
     review_score = min(
         math.log10(
             review_count
@@ -589,7 +637,6 @@ def calculate_value_score(
         1.0,
     )
 
-    # Teknik özellik doluluğu
     attribute_score = min(
         len(
             attributes
@@ -598,7 +645,7 @@ def calculate_value_score(
         1.0,
     )
 
-    final_score = (
+    return (
         0.35
         * price_score
         +
@@ -612,81 +659,23 @@ def calculate_value_score(
         * attribute_score
     )
 
-    return final_score
-
 
 # ============================================================
-# ÜRÜN AÇIKLAMASI
+# GRUP İÇİN EN İYİ F/P
 # ============================================================
 
-def describe_product(
-    product,
-):
-
-    parts = [
-        product[
-            "product_name"
-        ]
-    ]
-
-    price = product.get(
-        "_price"
-    )
-
-    rating = product.get(
-        "_rating"
-    )
-
-    review_count = product.get(
-        "_review_count",
-        0,
-    )
-
-    if price is not None:
-
-        parts.append(
-            f"fiyatı "
-            f"{format_price(price)}"
-        )
-
-    if rating is not None:
-
-        parts.append(
-            f"kullanıcı puanı "
-            f"{rating:g}"
-        )
-
-    if review_count:
-
-        parts.append(
-            f"{review_count} "
-            "değerlendirmeye sahip"
-        )
-
-    return ", ".join(
-        parts
-    )
-
-
-# ============================================================
-# FİYAT PERFORMANS ÖNERİSİ
-# ============================================================
-
-def generate_price_performance_recommendation(
-    brand,
-    category,
+def get_best_value_products(
     group,
+    limit=3,
 ):
 
     scored = []
 
     for product in group:
 
-        score = (
-            calculate_value_score(
-                product,
-                group,
-            )
+        score = calculate_value_score(
+            product,
+            group,
         )
 
         if score is None:
@@ -699,80 +688,146 @@ def generate_price_performance_recommendation(
             )
         )
 
-    if len(
-        scored
-    ) < 2:
-
-        return None
-
     scored.sort(
         key=lambda item:
         item[0],
         reverse=True,
     )
 
-    top_products = scored[
-        :TOP_N_RECOMMENDATIONS
+    return [
+        product
+        for score,
+        product
+        in scored[
+            :limit
+        ]
     ]
 
-    question = (
-        f"En iyi fiyat performans "
-        f"{brand} {category} önerisinde bulun."
-    )
 
-    best_score, best = (
-        top_products[0]
-    )
+# ============================================================
+# KISA CEVAP OLUŞTUR
+# ============================================================
+
+def recommendation_answer(
+    best,
+    alternatives=None,
+    reason=None,
+):
 
     answer = (
-        f"Veri setindeki {brand} {category} ürünleri "
-        "fiyat, kullanıcı puanı, değerlendirme sayısı ve "
-        "teknik özellik doluluğu birlikte değerlendirilerek "
-        f"sıralandığında {best['product_name']} öne çıkmaktadır. "
+        f"{best['product_name']} öne çıkıyor. "
         f"{describe_product(best)}."
     )
 
-    if len(
-        top_products
-    ) > 1:
+    if reason:
 
-        alternatives = [
+        answer += (
+            " "
+            + reason
+        )
+
+    if alternatives:
+
+        alt_text = "; ".join(
             describe_product(
                 product
             )
-            for _,
-            product
-            in top_products[
-                1:
+            for product
+            in alternatives[
+                :2
             ]
-        ]
+        )
 
         answer += (
             " Alternatif olarak "
-            + "; ".join(
-                alternatives
-            )
-            + " modelleri de değerlendirilebilir."
+            + alt_text
+            + " değerlendirilebilir."
         )
 
-    answer += (
-        " Bu öneri yalnızca veri setinde bulunan ürünler "
-        "ve mevcut fiyat/değerlendirme bilgileri üzerinden yapılmıştır."
-    )
-
-    return create_chat_record(
-        question,
-        answer,
-    )
+    return answer
 
 
 # ============================================================
-# EN YÜKSEK PUANLI ÜRÜN
+# F/P ÖNERİLERİ
 # ============================================================
 
-def generate_best_rated_recommendation(
-    brand,
-    category,
+def generate_value_records(
+    label,
+    group,
+):
+
+    best_products = (
+        get_best_value_products(
+            group,
+            TOP_N_RECOMMENDATIONS,
+        )
+    )
+
+    if len(
+        best_products
+    ) < 1:
+
+        return []
+
+    best = best_products[
+        0
+    ]
+
+    alternatives = best_products[
+        1:
+    ]
+
+    questions = [
+
+        (
+            f"En iyi fiyat performans "
+            f"{label} hangisi?"
+        ),
+
+        (
+            f"Fiyat performans açısından "
+            f"hangi {label} modelini önerirsin?"
+        ),
+
+        (
+            f"{label} almak istiyorum. "
+            "Fiyat performans açısından "
+            "hangi ürünü seçmeliyim?"
+        ),
+
+        (
+            f"Uygun fiyatlı ve iyi puanlı "
+            f"bir {label} önerir misin?"
+        ),
+    ]
+
+    answer = recommendation_answer(
+        best,
+        alternatives,
+        (
+            "Öneri fiyat, kullanıcı puanı, "
+            "değerlendirme sayısı ve mevcut "
+            "teknik özellikler birlikte dikkate "
+            "alınarak yapılmıştır."
+        ),
+    )
+
+    return [
+        create_chat_record(
+            question,
+            answer,
+        )
+        for question
+        in questions
+    ]
+
+
+# ============================================================
+# EN YÜKSEK PUAN
+# ============================================================
+
+def generate_rating_records(
+    label,
     group,
 ):
 
@@ -786,11 +841,8 @@ def generate_best_rated_recommendation(
         is not None
     ]
 
-    if len(
-        valid
-    ) < 2:
-
-        return None
+    if not valid:
+        return []
 
     valid.sort(
         key=lambda product:
@@ -806,150 +858,130 @@ def generate_best_rated_recommendation(
         reverse=True,
     )
 
-    best = valid[0]
+    best = valid[
+        0
+    ]
 
-    question = (
-        f"Kullanıcı puanına göre en iyi "
-        f"{brand} {category} hangisi?"
+    alternatives = valid[
+        1:3
+    ]
+
+    questions = [
+
+        f"En yüksek puanlı {label} hangisi?",
+
+        (
+            f"Kullanıcı puanlarına göre "
+            f"hangi {label} modelini önerirsin?"
+        ),
+
+        (
+            f"Kullanıcıların en çok beğendiği "
+            f"{label} seçeneklerinden birini öner."
+        ),
+    ]
+
+    answer = recommendation_answer(
+        best,
+        alternatives,
+        (
+            "Seçim kullanıcı puanı ve "
+            "değerlendirme sayısına göre yapılmıştır."
+        ),
     )
 
-    answer = (
-        f"Veri setindeki {brand} {category} ürünleri arasında "
-        f"{best['product_name']} {best['_rating']:g} kullanıcı puanıyla "
-        "en yüksek puanlı seçeneklerden biri olarak öne çıkmaktadır"
-    )
-
-    if best.get(
-        "_review_count"
-    ):
-
-        answer += (
-            f" ve {best['_review_count']} "
-            "değerlendirmeye sahiptir"
+    return [
+        create_chat_record(
+            question,
+            answer,
         )
-
-    answer += "."
-
-    return create_chat_record(
-        question,
-        answer,
-    )
+        for question
+        in questions
+    ]
 
 
 # ============================================================
-# BÜTÇE ÖNERİSİ
+# EN ÇOK DEĞERLENDİRME
 # ============================================================
 
-def generate_budget_recommendation(
-    brand,
-    category,
+def generate_popularity_records(
+    label,
     group,
 ):
 
-    priced = [
+    valid = [
         product
         for product
         in group
         if product.get(
-            "_price"
-        )
-        is not None
+            "_review_count",
+            0,
+        ) > 0
     ]
 
-    if len(
-        priced
-    ) < 3:
+    if not valid:
+        return []
 
-        return None
-
-    prices = sorted(
-        float(
-            product[
-                "_price"
-            ]
-        )
-        for product
-        in priced
-    )
-
-    # Yaklaşık median fiyatı bütçe sınırı yap
-    median_price = prices[
-        len(
-            prices
-        )
-        // 2
-    ]
-
-    budget = Decimal(
-        str(
-            round(
-                median_price
-                / 1000
-            )
-            * 1000
-        )
-    )
-
-    candidates = [
-        product
-        for product
-        in priced
-        if product[
-            "_price"
-        ]
-        <= budget
-    ]
-
-    if not candidates:
-        return None
-
-    candidates.sort(
+    valid.sort(
         key=lambda product:
-        (
-            product.get(
-                "_rating"
-            )
-            or 0,
-            product.get(
-                "_review_count"
-            )
-            or 0,
+        product.get(
+            "_review_count",
+            0,
         ),
         reverse=True,
     )
 
-    best = candidates[0]
+    best = valid[
+        0
+    ]
 
-    question = (
-        f"{format_price(budget)} bütçeyle "
-        f"hangi {brand} {category} modelini önerirsin?"
+    alternatives = valid[
+        1:3
+    ]
+
+    questions = [
+
+        (
+            f"En çok değerlendirilen "
+            f"{label} hangisi?"
+        ),
+
+        (
+            f"Popüler bir {label} "
+            "önerisinde bulun."
+        ),
+
+        (
+            f"Kullanıcılar tarafından çok "
+            f"değerlendirilen bir {label} öner."
+        ),
+    ]
+
+    answer = recommendation_answer(
+        best,
+        alternatives,
+        (
+            "Bu öneri değerlendirme sayısı "
+            "önceliklendirilerek yapılmıştır."
+        ),
     )
 
-    answer = (
-        f"{format_price(budget)} bütçe sınırı içinde "
-        f"veri setindeki seçenekler değerlendirildiğinde "
-        f"{best['product_name']} öne çıkmaktadır. "
-        f"{describe_product(best)}."
-    )
-
-    answer += (
-        " Bu seçim bütçe sınırı içindeki ürünlerin kullanıcı puanı "
-        "ve değerlendirme sayısı dikkate alınarak yapılmıştır."
-    )
-
-    return create_chat_record(
-        question,
-        answer,
-    )
+    return [
+        create_chat_record(
+            question,
+            answer,
+        )
+        for question
+        in questions
+    ]
 
 
 # ============================================================
-# EN UYGUN FİYATLI ÖNERİ
+# EN UCUZ
 # ============================================================
 
-def generate_cheapest_recommendation(
-    brand,
-    category,
+def generate_cheapest_records(
+    label,
     group,
 ):
 
@@ -963,135 +995,751 @@ def generate_cheapest_recommendation(
         is not None
     ]
 
-    if len(
-        valid
-    ) < 2:
+    if not valid:
+        return []
 
-        return None
-
-    cheapest = min(
-        valid,
+    valid.sort(
         key=lambda product:
         product[
             "_price"
         ],
     )
 
-    question = (
-        f"En uygun fiyatlı "
-        f"{brand} {category} hangisi?"
+    cheapest = valid[
+        0
+    ]
+
+    alternatives = valid[
+        1:3
+    ]
+
+    questions = [
+
+        f"En uygun fiyatlı {label} hangisi?",
+
+        (
+            f"Bütçemi düşük tutmak istiyorum. "
+            f"Hangi {label} modelini önerirsin?"
+        ),
+
+        (
+            f"Ekonomik bir {label} "
+            "önerisinde bulun."
+        ),
+    ]
+
+    answer = recommendation_answer(
+        cheapest,
+        alternatives,
+        (
+            "Bu seçim mevcut ürünler "
+            "arasındaki fiyat bilgilerine dayanmaktadır."
+        ),
     )
 
-    answer = (
-        f"Veri setindeki {brand} {category} seçenekleri arasında "
-        f"en düşük fiyatlı ürün {cheapest['product_name']} olarak "
-        f"görünmektedir. Listelenen fiyatı "
-        f"{format_price(cheapest['_price'])}."
-    )
-
-    if cheapest.get(
-        "_rating"
-    ) is not None:
-
-        answer += (
-            f" Kullanıcı puanı "
-            f"{cheapest['_rating']:g}."
+    return [
+        create_chat_record(
+            question,
+            answer,
         )
-
-    return create_chat_record(
-        question,
-        answer,
-    )
+        for question
+        in questions
+    ]
 
 
 # ============================================================
-# RECOMMENDATION ÜRET
+# BÜTÇE ÖNERİLERİ
+# ============================================================
+
+def create_budget_levels(
+    group,
+):
+
+    prices = sorted(
+        [
+            float(
+                product[
+                    "_price"
+                ]
+            )
+            for product
+            in group
+            if product.get(
+                "_price"
+            )
+            is not None
+        ]
+    )
+
+    if len(
+        prices
+    ) < 2:
+
+        return []
+
+    # Farklı percentile benzeri bütçe seviyeleri
+    indexes = [
+        int(
+            len(
+                prices
+            )
+            * 0.35
+        ),
+        int(
+            len(
+                prices
+            )
+            * 0.55
+        ),
+        int(
+            len(
+                prices
+            )
+            * 0.75
+        ),
+        len(
+            prices
+        )
+        - 1,
+    ]
+
+    budgets = set()
+
+    for index in indexes:
+
+        index = min(
+            index,
+            len(
+                prices
+            )
+            - 1,
+        )
+
+        raw = prices[
+            index
+        ]
+
+        rounded = max(
+            1000,
+            round(
+                raw
+                / 1000
+            )
+            * 1000,
+        )
+
+        budgets.add(
+            Decimal(
+                str(
+                    rounded
+                )
+            )
+        )
+
+    return sorted(
+        budgets
+    )
+
+
+def generate_budget_records(
+    label,
+    group,
+):
+
+    records = []
+
+    budgets = (
+        create_budget_levels(
+            group
+        )
+    )
+
+    for budget in budgets:
+
+        candidates = [
+            product
+            for product
+            in group
+            if (
+                product.get(
+                    "_price"
+                )
+                is not None
+                and product[
+                    "_price"
+                ]
+                <= budget
+            )
+        ]
+
+        if not candidates:
+            continue
+
+        # Bütçe içindeki ürünlerde F/P
+        best_list = (
+            get_best_value_products(
+                candidates,
+                3,
+            )
+        )
+
+        if not best_list:
+
+            # Skor oluşmadıysa rating'e göre
+            candidates.sort(
+                key=lambda product:
+                (
+                    product.get(
+                        "_rating"
+                    )
+                    or 0,
+                    product.get(
+                        "_review_count",
+                        0,
+                    ),
+                ),
+                reverse=True,
+            )
+
+            best_list = candidates[
+                :3
+            ]
+
+        best = best_list[
+            0
+        ]
+
+        alternatives = best_list[
+            1:
+        ]
+
+        questions = [
+
+            (
+                f"{format_price(budget)} bütçeyle "
+                f"hangi {label} modelini önerirsin?"
+            ),
+
+            (
+                f"{format_price(budget)} altında "
+                f"iyi bir {label} öner."
+            ),
+
+            (
+                f"Bütçem {format_price(budget)}. "
+                f"Hangi {label} daha mantıklı?"
+            ),
+        ]
+
+        answer = recommendation_answer(
+            best,
+            alternatives,
+            (
+                f"Bu ürün {format_price(budget)} "
+                "bütçe sınırı içindeki seçenekler "
+                "arasından seçilmiştir."
+            ),
+        )
+
+        for question in questions:
+
+            records.append(
+                create_chat_record(
+                    question,
+                    answer,
+                )
+            )
+
+    return records
+
+
+# ============================================================
+# YÜKSEK PUAN + UYGUN FİYAT
+# ============================================================
+
+def generate_affordable_high_rating_records(
+    label,
+    group,
+):
+
+    valid = [
+        product
+        for product
+        in group
+        if (
+            product.get(
+                "_price"
+            )
+            is not None
+            and product.get(
+                "_rating"
+            )
+            is not None
+            and product[
+                "_rating"
+            ]
+            >= MIN_GOOD_RATING
+        )
+    ]
+
+    if len(
+        valid
+    ) < 2:
+
+        return []
+
+    valid.sort(
+        key=lambda product:
+        (
+            product[
+                "_price"
+            ],
+            -product[
+                "_rating"
+            ],
+        )
+    )
+
+    best = valid[
+        0
+    ]
+
+    alternatives = valid[
+        1:3
+    ]
+
+    questions = [
+
+        (
+            f"Uygun fiyatlı ama yüksek puanlı "
+            f"bir {label} önerir misin?"
+        ),
+
+        (
+            f"Hem ekonomik hem kullanıcı puanı "
+            f"iyi olan bir {label} arıyorum."
+        ),
+
+        (
+            f"Fiyatı uygun ve kullanıcıları memnun "
+            f"eden bir {label} öner."
+        ),
+    ]
+
+    answer = recommendation_answer(
+        best,
+        alternatives,
+        (
+            f"Seçilen ürünün kullanıcı puanı "
+            f"{best['_rating']:g} ve fiyatı "
+            f"{format_price(best['_price'])}."
+        ),
+    )
+
+    return [
+        create_chat_record(
+            question,
+            answer,
+        )
+        for question
+        in questions
+    ]
+
+
+# ============================================================
+# TEKNİK ÖZELLİK BAZLI ÖNERİLER
+# ============================================================
+
+IMPORTANT_ATTRIBUTE_KEYWORDS = [
+
+    "ram",
+    "bellek",
+    "ssd",
+    "disk",
+    "işlemci",
+    "ekran kartı",
+    "gpu",
+    "ekran boyutu",
+    "çözünürlük",
+    "kapasite",
+]
+
+
+def normalize_attribute_key(
+    key,
+):
+
+    return (
+        clean_text(
+            key
+        )
+        .lower()
+    )
+
+
+def generate_attribute_records(
+    label,
+    group,
+):
+
+    attribute_groups = defaultdict(
+        list
+    )
+
+    for product in group:
+
+        attributes = product.get(
+            "attributes",
+            {},
+        )
+
+        for key, value in (
+            attributes.items()
+        ):
+
+            key_clean = (
+                normalize_attribute_key(
+                    key
+                )
+            )
+
+            value_clean = (
+                clean_text(
+                    value
+                )
+            )
+
+            if not value_clean:
+                continue
+
+            if not any(
+                keyword
+                in key_clean
+                for keyword
+                in IMPORTANT_ATTRIBUTE_KEYWORDS
+            ):
+                continue
+
+            attribute_groups[
+                (
+                    key_clean,
+                    value_clean,
+                )
+            ].append(
+                product
+            )
+
+    records = []
+
+    # Çok fazla teknik örnek üretmemek için
+    candidates = []
+
+    for (
+        key,
+        value,
+    ), products in (
+        attribute_groups.items()
+    ):
+
+        if len(
+            products
+        ) < MIN_ATTRIBUTE_MATCH_COUNT:
+
+            continue
+
+        candidates.append(
+            (
+                key,
+                value,
+                products,
+            )
+        )
+
+    random.shuffle(
+        candidates
+    )
+
+    # Grup başına maksimum 10 teknik özellik varyasyonu
+    for (
+        key,
+        value,
+        products,
+    ) in candidates[
+        :10
+    ]:
+
+        best_list = (
+            get_best_value_products(
+                products,
+                3,
+            )
+        )
+
+        if not best_list:
+
+            continue
+
+        best = best_list[
+            0
+        ]
+
+        alternatives = best_list[
+            1:
+        ]
+
+        questions = [
+
+            (
+                f"{value} {key} özelliğine sahip "
+                f"bir {label} önerir misin?"
+            ),
+
+            (
+                f"{key} değeri {value} olan "
+                f"iyi bir {label} hangisi?"
+            ),
+        ]
+
+        answer = recommendation_answer(
+            best,
+            alternatives,
+            (
+                f"Bu ürünün {key} bilgisi "
+                f"{value} olarak listelenmiştir."
+            ),
+        )
+
+        for question in questions:
+
+            records.append(
+                create_chat_record(
+                    question,
+                    answer,
+                )
+            )
+
+    return records
+
+
+# ============================================================
+# TEK GRUPTAN TÜM ÖNERİLER
+# ============================================================
+
+def generate_group_records(
+    label,
+    group,
+):
+
+    if len(
+        group
+    ) < MIN_PRODUCTS_PER_GROUP:
+
+        return []
+
+    records = []
+
+    records.extend(
+        generate_value_records(
+            label,
+            group,
+        )
+    )
+
+    records.extend(
+        generate_rating_records(
+            label,
+            group,
+        )
+    )
+
+    records.extend(
+        generate_popularity_records(
+            label,
+            group,
+        )
+    )
+
+    records.extend(
+        generate_cheapest_records(
+            label,
+            group,
+        )
+    )
+
+    records.extend(
+        generate_budget_records(
+            label,
+            group,
+        )
+    )
+
+    records.extend(
+        generate_affordable_high_rating_records(
+            label,
+            group,
+        )
+    )
+
+    records.extend(
+        generate_attribute_records(
+            label,
+            group,
+        )
+    )
+
+    return records
+
+
+# ============================================================
+# RECOMMENDATION ÜRETİMİ
 # ============================================================
 
 def generate_recommendations(
     products,
 ):
 
-    groups = defaultdict(
+    # 1. Kategori grupları
+    category_groups = defaultdict(
+        list
+    )
+
+    # 2. Marka + kategori grupları
+    brand_category_groups = defaultdict(
+        list
+    )
+
+    # 3. Marka grupları
+    brand_groups = defaultdict(
         list
     )
 
     for product in products:
 
-        brand = clean_text(
-            product.get(
-                "brand"
-            )
-        )
-
         category = product.get(
             "_category"
         )
 
-        if (
-            not brand
-            or category
-            == "Bilinmeyen"
-        ):
-
-            continue
-
-        groups[
-            (
-                brand,
-                category,
-            )
-        ].append(
-            product
+        brand = product.get(
+            "_brand"
         )
 
+        if (
+            category
+            and category
+            != "Bilinmeyen"
+        ):
+
+            category_groups[
+                category
+            ].append(
+                product
+            )
+
+        if brand:
+
+            brand_groups[
+                brand
+            ].append(
+                product
+            )
+
+        if (
+            brand
+            and category
+            and category
+            != "Bilinmeyen"
+        ):
+
+            brand_category_groups[
+                (
+                    brand,
+                    category,
+                )
+            ].append(
+                product
+            )
+
     dataset = []
+
+    # ========================================================
+    # SADECE KATEGORİ
+    # ========================================================
+
+    for (
+        category,
+        group,
+    ) in category_groups.items():
+
+        label = category
+
+        dataset.extend(
+            generate_group_records(
+                label,
+                group,
+            )
+        )
+
+    # ========================================================
+    # MARKA + KATEGORİ
+    # ========================================================
 
     for (
         brand,
         category,
-    ), group in groups.items():
+    ), group in (
+        brand_category_groups.items()
+    ):
+
+        label = (
+            f"{brand} {category}"
+        )
+
+        dataset.extend(
+            generate_group_records(
+                label,
+                group,
+            )
+        )
+
+    # ========================================================
+    # MARKA GENEL
+    # ========================================================
+
+    for (
+        brand,
+        group,
+    ) in brand_groups.items():
 
         if len(
             group
-        ) < MIN_PRODUCTS_PER_GROUP:
+        ) < 3:
 
             continue
 
-        generators = [
-            generate_price_performance_recommendation,
-            generate_best_rated_recommendation,
-            generate_budget_recommendation,
-            generate_cheapest_recommendation,
-        ]
+        label = (
+            f"{brand} ürünü"
+        )
 
-        count = 0
-
-        for generator in generators:
-
-            record = (
-                generator(
-                    brand,
-                    category,
-                    group,
-                )
+        dataset.extend(
+            generate_value_records(
+                label,
+                group,
             )
+        )
 
-            if not record:
-                continue
-
-            dataset.append(
-                record
+        dataset.extend(
+            generate_rating_records(
+                label,
+                group,
             )
+        )
 
-            count += 1
-
-            if (
-                count
-                >= MAX_RECOMMENDATIONS_PER_GROUP
-            ):
-
-                break
+        dataset.extend(
+            generate_cheapest_records(
+                label,
+                group,
+            )
+        )
 
     return dataset
 
@@ -1207,7 +1855,7 @@ def main():
     )
 
     print(
-        "\nRecommendation örnekleri oluşturuluyor..."
+        "\nRecommendation V2 örnekleri oluşturuluyor..."
     )
 
     recommendations = (
@@ -1217,7 +1865,48 @@ def main():
     )
 
     print(
-        "Yeni recommendation kaydı:",
+        "Duplicate öncesi recommendation:",
+        len(
+            recommendations
+        ),
+    )
+
+    recommendations = (
+        remove_duplicates(
+            recommendations
+        )
+    )
+
+    print(
+        "Duplicate sonrası recommendation:",
+        len(
+            recommendations
+        ),
+    )
+
+    # ========================================================
+    # HEDEF SAYIYA GÖRE SINIRLA
+    # ========================================================
+
+    random.shuffle(
+        recommendations
+    )
+
+    if (
+        len(
+            recommendations
+        )
+        > TARGET_RECOMMENDATION_COUNT
+    ):
+
+        recommendations = (
+            recommendations[
+                :TARGET_RECOMMENDATION_COUNT
+            ]
+        )
+
+    print(
+        "Final recommendation kayıt sayısı:",
         len(
             recommendations
         ),
@@ -1253,15 +1942,15 @@ def main():
 
     print(
         "\n"
-        + "=" * 70
+        + "=" * 75
     )
 
     print(
-        "RECOMMENDATION CHAT DATASET HAZIR"
+        "RECOMMENDATION CHAT DATASET V2 HAZIR"
     )
 
     print(
-        "=" * 70
+        "=" * 75
     )
 
     print(
@@ -1272,7 +1961,7 @@ def main():
     )
 
     print(
-        "Recommendation kayıtları:",
+        "Recommendation V2 kayıtları:",
         len(
             recommendations
         ),
@@ -1303,7 +1992,9 @@ def main():
 
         print(
             json.dumps(
-                recommendations[0],
+                recommendations[
+                    0
+                ],
                 ensure_ascii=False,
                 indent=2,
             )
